@@ -1,0 +1,14 @@
+[package]
+name = "mongo-repair-utf8"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+color-eyre = "0"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = "1"
+futures = "0.3"
+mongodb = { version = "3" }
+dialoguer = "0"
+pretty_assertions = "1"
