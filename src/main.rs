@@ -18,6 +18,12 @@ pub struct Options {
     pub collection_names: Vec<String>,
     #[arg(long = "confirm", help = "Confirm changes interactively")]
     pub confirm: Option<bool>,
+    #[arg(
+        long = "dry-run",
+        default_value = "false",
+        help = "Run in dry run mode"
+    )]
+    pub dry_run: bool,
 }
 
 fn fix_string(
@@ -26,7 +32,7 @@ fn fix_string(
     elem: &bson::raw::RawElement,
     start: usize,
     confirm: bool,
-) -> eyre::Result<String> {
+) -> eyre::Result<(bool, String)> {
     let bytes = doc.as_bytes();
 
     let key_start = start + 4 + 1;
@@ -73,9 +79,9 @@ fn fix_string(
 
     Ok(if confirmation {
         println!("{}", &prompt);
-        new_value_utf8
+        (true, new_value_utf8)
     } else {
-        old_value_utf8
+        (false, old_value_utf8)
     })
 }
 
@@ -83,7 +89,8 @@ fn fix_document(
     doc: &bson::RawDocument,
     new_doc: &mut bson::RawDocumentBuf,
     confirm: bool,
-) -> eyre::Result<()> {
+) -> eyre::Result<bool> {
+    let mut changed = false;
     let mut start = 0;
     for elem in doc.iter_elements() {
         let elem = elem?;
@@ -126,10 +133,11 @@ fn fix_document(
                     ..
                 }) = value
                 {
-                    new_doc.append(
-                        key,
-                        bson::raw::RawBson::String(fix_string(doc, key, &elem, start, confirm)?),
-                    );
+                    let (fixed, value) = fix_string(doc, key, &elem, start, confirm)?;
+                    new_doc.append(key, bson::raw::RawBson::String(value));
+                    if fixed {
+                        changed = true;
+                    }
                 } else {
                     new_doc.append(key, value?.to_raw_bson());
                 }
@@ -140,36 +148,34 @@ fn fix_document(
         }
         start += 1 + key.len() + 1 + elem.len();
     }
-    Ok(())
+    Ok(changed)
 }
 
 async fn fix_collection(
     collection: mongodb::Collection<bson::RawDocumentBuf>,
     confirm: bool,
+    dry_run: bool,
 ) -> eyre::Result<()> {
     let mut cursor = collection.find(bson::doc! {}).await?;
     while let Some(raw_doc) = cursor.try_next().await? {
         let mut new_raw_doc = bson::raw::RawDocumentBuf::new();
 
+        let id = raw_doc.get_object_id("_id").ok();
+
         println!(
             "collection = {: <20} id = {: <30}",
             collection.name(),
-            raw_doc
-                .get_object_id("_id")
-                .ok()
-                .map(bson::oid::ObjectId::to_hex)
-                .as_deref()
-                .unwrap_or("")
+            id.map(bson::oid::ObjectId::to_hex).as_deref().unwrap_or("")
         );
 
-        fix_document(&*raw_doc, &mut new_raw_doc, confirm)?;
+        let changed = fix_document(&*raw_doc, &mut new_raw_doc, confirm)?;
 
         let doc = raw_doc.to_document();
-        let fixed_doc = new_raw_doc.to_document();
+        let fixed_doc = new_raw_doc.clone().to_document();
 
-        match (doc, fixed_doc) {
+        match (&doc, &fixed_doc) {
             (Ok(doc), Ok(fixed_doc)) => {
-                print!("{}", Comparison::new(&doc, &fixed_doc));
+                // print!("{}", Comparison::new(&doc, &fixed_doc));
                 if doc != fixed_doc {
                     print!("{}", Comparison::new(&doc, &fixed_doc));
                 }
@@ -182,6 +188,20 @@ async fn fix_collection(
                 println!("{:?}", fixed_doc);
             }
         }
+
+        if !dry_run && changed {
+            // replace the document
+            if let Ok(id) = raw_doc.get_object_id("_id") {
+                collection
+                    .find_one_and_replace(bson::doc! {"_id": id}, new_raw_doc)
+                    .await?;
+                println!(
+                    "collection = {: <20} id = {: <30} REPLACED",
+                    collection.name(),
+                    id.to_hex()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -190,8 +210,6 @@ async fn fix_collection(
 async fn main() -> eyre::Result<()> {
     color_eyre::install()?;
     let options = Options::parse();
-
-    println!("{:?}", options);
 
     let client = Client::with_uri_str(&options.connection_uri).await?;
 
@@ -203,7 +221,7 @@ async fn main() -> eyre::Result<()> {
     println!("connected to {}", options.connection_uri);
 
     let Some(database_name) = options.database_name else {
-        println!("no database specified");
+        eprintln!("no database specified");
         return Ok(());
     };
 
@@ -213,22 +231,7 @@ async fn main() -> eyre::Result<()> {
         options.collection_names
     } else {
         db.list_collection_names().await?
-        // let all_collections = db
-        //     .run_command(bson::doc! {
-        //       "listCollections": 1,
-        //       "nameOnly": true,
-        //       "authorizedCollections": true,
-        //     })
-        //     .await?;
-        // println!("{:#?}", all_collections);
-        // all_collections.
-        // Vec::new()
     };
-
-    // let Some(collection_name) = options.collections else {
-    //     println!("no collection specified");
-    //     return Ok(());
-    // };
 
     let confirm = options.confirm.unwrap_or(false);
 
@@ -237,7 +240,7 @@ async fn main() -> eyre::Result<()> {
             let db_clone = db.clone();
             async move {
                 let collection = db_clone.collection::<bson::RawDocumentBuf>(&col);
-                fix_collection(collection, confirm).await
+                fix_collection(collection, confirm, options.dry_run).await
             }
         })
         .buffered(1)
